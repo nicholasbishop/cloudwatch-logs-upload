@@ -3,6 +3,11 @@ name = "cloudwatch-logs-upload"
 version = "0.1.0"
 authors = ["Nicholas Bishop <nicholasbishop@gmail.com>"]
 edition = "2018"
+description = "Library for uploading events to AWS CloudWatch Logs"
+keywords = ["aws", "cloudwatch", "logs"]
+repository = "https://github.com/nicholasbishop/cloudwatch-logs-upload"
+license = "Apache-2.0"
+readme = "README.md"
 
 [dependencies]
 fehler = "1.0"
