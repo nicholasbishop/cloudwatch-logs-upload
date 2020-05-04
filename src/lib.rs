@@ -1,5 +1,9 @@
 use fehler::{throw, throws};
-use rusoto_logs::{InputLogEvent, PutLogEventsRequest};
+use rusoto_core::RusotoError;
+use rusoto_logs::{
+    CloudWatchLogs, CloudWatchLogsClient, InputLogEvent, PutLogEventsError,
+    PutLogEventsRequest,
+};
 use std::time::SystemTime;
 
 /// The maximum number of log events in a batch is 10,000.
@@ -35,16 +39,18 @@ pub fn get_current_timestamp() -> Timestamp {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("event exceeds the max batch size")]
     EventTooLarge(usize),
+    #[error("failed to upload log batch: {0}")]
+    PutLogsError(#[from] RusotoError<PutLogEventsError>),
 }
 
 pub type Batch = PutLogEventsRequest;
 
 #[derive(Default)]
-pub struct BatchUploader {
+pub struct QueuedBatches {
     /// Queued batches that haven't been sent yet.
     ///
     /// Box the batch so that adding and removing elements from the
@@ -56,7 +62,7 @@ pub struct BatchUploader {
     current_batch_size: usize,
 }
 
-impl BatchUploader {
+impl QueuedBatches {
     /// Add a new event.
     ///
     /// There are a couple AWS limits not enforced yet:
@@ -128,13 +134,66 @@ impl BatchUploader {
     }
 }
 
+pub struct BatchUploader {
+    queued_batches: QueuedBatches,
+
+    client: CloudWatchLogsClient,
+    next_sequence_token: Option<String>,
+}
+
+impl BatchUploader {
+    /// Add a new event.
+    ///
+    /// There are a couple AWS limits not enforced yet:
+    ///
+    /// - None of the log events in the batch can be more than 2 hours
+    ///   in the future
+    ///
+    /// - None of the log events in the batch can be older than 14 days
+    ///   or older than the retention period of the log group
+    #[throws]
+    pub fn add_event(&mut self, event: InputLogEvent) {
+        self.queued_batches.add_event(event)?;
+    }
+
+    #[throws]
+    pub fn upload_batch(&mut self) {
+        let mut batch = if let Some(batch) = self.queued_batches.batches.pop() {
+            batch
+        } else {
+            return;
+        };
+
+        batch.sequence_token = self.next_sequence_token.clone();
+        // TODO: add log/stream names
+
+        match self.client.put_log_events(*batch).sync() {
+            Ok(resp) => {
+                self.next_sequence_token = resp.next_sequence_token;
+
+                // TODO: handle rejected events
+            }
+            Err(err) => {
+                // TODO: if the batch upload failed, consider putting
+                // the batch back. Unfortunately this requires cloning
+                // the batch.
+
+                // TODO: I assume that if this happens we need to refresh the
+                // sequence token
+
+                throw!(err);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_event_too_large() {
-        let mut uploader = BatchUploader::default();
+        let mut qb = QueuedBatches::default();
 
         // Create a message that is at the limit
         let max_message_size = MAX_BATCH_SIZE - EVENT_OVERHEAD;
@@ -144,49 +203,46 @@ mod tests {
         }
 
         // Verify the message is added successfully
-        uploader
-            .add_event(InputLogEvent {
-                message: message.clone(),
-                timestamp: 0,
-            })
-            .unwrap();
+        qb.add_event(InputLogEvent {
+            message: message.clone(),
+            timestamp: 0,
+        })
+        .unwrap();
 
         // Make the message too big
         message.push('x');
-        assert_eq!(
-            uploader.add_event(InputLogEvent {
+        assert!(matches!(
+            qb.add_event(InputLogEvent {
                 message,
                 timestamp: 0,
             }),
-            Err(Error::EventTooLarge(MAX_BATCH_SIZE + 1))
-        );
+            Err(Error::EventTooLarge(size)) if size == MAX_BATCH_SIZE + 1
+        ));
     }
 
     #[test]
     fn test_max_events_in_batch() {
-        let mut uploader = BatchUploader::default();
+        let mut qb = QueuedBatches::default();
         for _ in 0..MAX_EVENTS_IN_BATCH {
-            uploader
-                .add_event(InputLogEvent {
-                    ..Default::default()
-                })
-                .unwrap();
-            // All of these events should fit in one batch
-            assert_eq!(uploader.batches.len(), 1);
-        }
-
-        // Verify that adding one more event creates a new batch
-        uploader
-            .add_event(InputLogEvent {
+            qb.add_event(InputLogEvent {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(uploader.batches.len(), 2);
+            // All of these events should fit in one batch
+            assert_eq!(qb.batches.len(), 1);
+        }
+
+        // Verify that adding one more event creates a new batch
+        qb.add_event(InputLogEvent {
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 2);
     }
 
     #[test]
     fn test_max_batch_size() {
-        let mut uploader = BatchUploader::default();
+        let mut qb = QueuedBatches::default();
 
         // Create a message slightly under the limit
         let message_size = MAX_BATCH_SIZE - EVENT_OVERHEAD * 2;
@@ -196,82 +252,72 @@ mod tests {
         }
 
         // Verify the message is added successfully
-        uploader
-            .add_event(InputLogEvent {
-                message: message.clone(),
-                timestamp: 0,
-            })
-            .unwrap();
-        assert_eq!(uploader.batches.len(), 1);
-        assert_eq!(uploader.current_batch_size, message_size + EVENT_OVERHEAD);
+        qb.add_event(InputLogEvent {
+            message: message.clone(),
+            timestamp: 0,
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 1);
+        assert_eq!(qb.current_batch_size, message_size + EVENT_OVERHEAD);
 
         // Verify that adding one more message within the batch is OK
-        uploader
-            .add_event(InputLogEvent {
-                message: "".to_string(),
-                timestamp: 0,
-            })
-            .unwrap();
-        assert_eq!(uploader.batches.len(), 1);
-        assert_eq!(
-            uploader.current_batch_size,
-            message_size + EVENT_OVERHEAD * 2
-        );
+        qb.add_event(InputLogEvent {
+            message: "".to_string(),
+            timestamp: 0,
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 1);
+        assert_eq!(qb.current_batch_size, message_size + EVENT_OVERHEAD * 2);
 
         // Verify that adding anything else goes into a new batch
-        uploader
-            .add_event(InputLogEvent {
-                message: "".to_string(),
-                timestamp: 0,
-            })
-            .unwrap();
-        assert_eq!(uploader.batches.len(), 2);
-        assert_eq!(uploader.current_batch_size, EVENT_OVERHEAD);
+        qb.add_event(InputLogEvent {
+            message: "".to_string(),
+            timestamp: 0,
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 2);
+        assert_eq!(qb.current_batch_size, EVENT_OVERHEAD);
     }
 
     #[test]
     fn test_timestamp_order() {
-        let mut uploader = BatchUploader::default();
+        let mut qb = QueuedBatches::default();
 
         // Add an event at time 1
-        uploader
-            .add_event(InputLogEvent {
-                message: "".to_string(),
-                timestamp: 1,
-            })
-            .unwrap();
-        assert_eq!(uploader.batches.len(), 1);
+        qb.add_event(InputLogEvent {
+            message: "".to_string(),
+            timestamp: 1,
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 1);
 
         // Add an event at time 0, verify it goes into a new batch
-        uploader
-            .add_event(InputLogEvent {
-                message: "".to_string(),
-                timestamp: 0,
-            })
-            .unwrap();
-        assert_eq!(uploader.batches.len(), 2);
+        qb.add_event(InputLogEvent {
+            message: "".to_string(),
+            timestamp: 0,
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 2);
     }
 
     #[test]
     fn test_batch_max_duration() {
-        let mut uploader = BatchUploader::default();
+        let mut qb = QueuedBatches::default();
 
         // Add an event at time 0
-        uploader
-            .add_event(InputLogEvent {
-                message: "".to_string(),
-                timestamp: 0,
-            })
-            .unwrap();
-        assert_eq!(uploader.batches.len(), 1);
+        qb.add_event(InputLogEvent {
+            message: "".to_string(),
+            timestamp: 0,
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 1);
 
         // Add an event over 24 hours later, verify it goes into a new batch
-        uploader
-            .add_event(InputLogEvent {
-                message: "".to_string(),
-                timestamp: MAX_DURATION_MILLIS + 1,
-            })
-            .unwrap();
-        assert_eq!(uploader.batches.len(), 2);
+        qb.add_event(InputLogEvent {
+            message: "".to_string(),
+            timestamp: MAX_DURATION_MILLIS + 1,
+        })
+        .unwrap();
+        assert_eq!(qb.batches.len(), 2);
     }
 }
