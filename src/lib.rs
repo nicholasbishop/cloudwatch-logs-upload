@@ -134,6 +134,7 @@ impl QueuedBatches {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadTarget {
     pub group: String,
     pub stream: String,
@@ -150,8 +151,8 @@ pub struct BatchUploader {
 
 impl BatchUploader {
     pub fn new(
-        target: UploadTarget,
         client: CloudWatchLogsClient,
+        target: UploadTarget,
     ) -> BatchUploader {
         BatchUploader {
             target,
@@ -204,6 +205,10 @@ impl BatchUploader {
                 throw!(err);
             }
         }
+    }
+
+    pub fn start_background_thread(&self) {
+        // TODO
     }
 }
 
