@@ -134,7 +134,14 @@ impl QueuedBatches {
     }
 }
 
+pub struct UploadTarget {
+    pub group: String,
+    pub stream: String,
+}
+
 pub struct BatchUploader {
+    target: UploadTarget,
+
     queued_batches: QueuedBatches,
 
     client: CloudWatchLogsClient,
@@ -142,6 +149,18 @@ pub struct BatchUploader {
 }
 
 impl BatchUploader {
+    pub fn new(
+        target: UploadTarget,
+        client: CloudWatchLogsClient,
+    ) -> BatchUploader {
+        BatchUploader {
+            target,
+            client,
+            queued_batches: QueuedBatches::default(),
+            next_sequence_token: None,
+        }
+    }
+
     /// Add a new event.
     ///
     /// There are a couple AWS limits not enforced yet:
@@ -165,7 +184,8 @@ impl BatchUploader {
         };
 
         batch.sequence_token = self.next_sequence_token.clone();
-        // TODO: add log/stream names
+        batch.log_group_name = self.target.group.clone();
+        batch.log_stream_name = self.target.stream.clone();
 
         match self.client.put_log_events(*batch).sync() {
             Ok(resp) => {
