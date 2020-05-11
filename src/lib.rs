@@ -2,7 +2,8 @@ use fehler::{throw, throws};
 use log::error;
 use rusoto_core::RusotoError;
 use rusoto_logs::{
-    CloudWatchLogs, CloudWatchLogsClient, InputLogEvent, PutLogEventsError,
+    CloudWatchLogs, CloudWatchLogsClient, DescribeLogStreamsError,
+    DescribeLogStreamsRequest, InputLogEvent, PutLogEventsError,
     PutLogEventsRequest,
 };
 use std::{
@@ -51,6 +52,10 @@ pub enum Error {
     EventTooLarge(usize),
     #[error("failed to upload log batch: {0}")]
     PutLogsError(#[from] RusotoError<PutLogEventsError>),
+    #[error("failed to get sequence token: {0}")]
+    SequenceTokenError(#[from] RusotoError<DescribeLogStreamsError>),
+    #[error("invalid log stream")]
+    InvalidLogStream,
     #[error("failed to lock the mutex")]
     PoisonedLock,
     #[error("upload thread already started")]
@@ -212,12 +217,51 @@ struct BatchUploaderInternal {
 
 impl BatchUploaderInternal {
     #[throws]
+    fn refresh_sequence_token(&mut self) {
+        let resp = self
+            .client
+            .describe_log_streams(DescribeLogStreamsRequest {
+                limit: Some(1),
+                order_by: Some("LogStreamName".into()),
+                log_group_name: self.target.group.clone(),
+                log_stream_name_prefix: Some(self.target.stream.clone()),
+                ..Default::default()
+            })
+            .sync()?;
+        let log_streams = resp.log_streams.ok_or(Error::InvalidLogStream)?;
+        // TODO: need to verify that this is correct if you have
+        // multiple log streams with the same prefix. I *think* it's
+        // good because we are sorting by stream name and limiting to
+        // 1, so as long as "myPrefix" gets sorted before
+        // "myPrefixAndOtherStuff" this should be correct. Needs
+        // testing though.
+        let log_stream = log_streams.first().ok_or(Error::InvalidLogStream)?;
+        if Some(self.target.stream.clone()) != log_stream.log_stream_name {
+            // This should never happen
+            error!(
+                "log stream name {} != {:?}",
+                self.target.stream, log_stream.log_stream_name
+            );
+            throw!(Error::InvalidLogStream);
+        }
+        self.next_sequence_token = log_stream.upload_sequence_token.clone();
+    }
+
+    #[throws]
     fn upload_batch(&mut self) {
         let mut batch = if let Some(batch) = self.queued_batches.batches.pop() {
             *batch
         } else {
             return;
         };
+
+        // Refresh the sequence token if necessary. This actually
+        // isn't needed right after creating the log stream, so
+        // there's an unnecessary fetch here the first time, but
+        // that's probably fine.
+        if self.next_sequence_token.is_none() {
+            self.refresh_sequence_token()?;
+        }
 
         // The events must be sorted by timestamp
         batch.sort_unstable_by_key(|event| event.timestamp);
@@ -239,8 +283,9 @@ impl BatchUploaderInternal {
                 // TODO: if the batch upload failed, consider putting
                 // the batch back.
 
-                // TODO: I assume that if this happens we need to refresh the
-                // sequence token
+                // Clear the sequence token so that it gets refreshed
+                // next time
+                self.next_sequence_token = None;
 
                 throw!(err);
             }
