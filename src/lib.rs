@@ -46,20 +46,35 @@ pub fn get_current_timestamp() -> Timestamp {
     }
 }
 
+/// Unified event type for upload errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Event message string is larger than 1,048,550 bytes.
     #[error("event exceeds the max batch size")]
     EventTooLarge(usize),
+
+    /// An API error was returned when trying to upload a batch.
     #[error("failed to upload log batch: {0}")]
     PutLogsError(#[from] RusotoError<PutLogEventsError>),
+
+    /// An API error was returned when trying to get the log stream
+    /// upload sequence token.
     #[error("failed to get sequence token: {0}")]
     SequenceTokenError(#[from] RusotoError<DescribeLogStreamsError>),
+
+    /// The log stream does not exist.
     #[error("invalid log stream")]
     InvalidLogStream,
+
+    /// An internal mutex error occurred.
     #[error("failed to lock the mutex")]
     PoisonedLock,
+
+    /// The background upload thread can only be started once.
     #[error("upload thread already started")]
     ThreadAlreadyStarted,
+
+    /// Failed to start the background upload thread.
     #[error("failed to spawn thread: {0}")]
     SpawnError(io::Error),
 }
@@ -101,6 +116,12 @@ impl TimestampRange {
     }
 }
 
+/// Internal interface for creating batches of events.
+///
+/// This shouldn't normally need to be used directly, but is exposed
+/// in case the BatchUploader interface doesn't behave quite the way
+/// you want, you might still find value in using QueuedBatches to
+/// handle the various batch upload limits.
 #[derive(Default)]
 pub struct QueuedBatches {
     /// Queued batches that haven't been sent yet.
@@ -198,9 +219,12 @@ impl QueuedBatches {
     }
 }
 
+/// Log group and stream names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UploadTarget {
+    /// Log group name.
     pub group: String,
+    /// Log stream name.
     pub stream: String,
 }
 
@@ -293,6 +317,9 @@ impl BatchUploaderInternal {
     }
 }
 
+/// Main interface for uploading logs in batches to AWS CloudWatch Logs.
+///
+/// This can be safely used from multiple threads by cloning it.
 #[derive(Clone)]
 pub struct BatchUploader {
     internal: Arc<Mutex<BatchUploaderInternal>>,
@@ -330,6 +357,7 @@ impl BatchUploader {
         guard.queued_batches.add_event(event)?;
     }
 
+    /// Start a background thread for uploading batches of events.
     #[throws]
     pub fn start_background_thread(&self) -> thread::JoinHandle<()> {
         let mut guard =
