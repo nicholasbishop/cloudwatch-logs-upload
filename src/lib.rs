@@ -1,10 +1,16 @@
 use fehler::{throw, throws};
+use log::error;
 use rusoto_core::RusotoError;
 use rusoto_logs::{
     CloudWatchLogs, CloudWatchLogsClient, InputLogEvent, PutLogEventsError,
     PutLogEventsRequest,
 };
-use std::time::SystemTime;
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, SystemTime},
+};
 
 /// The maximum number of log events in a batch is 10,000.
 pub const MAX_EVENTS_IN_BATCH: usize = 10_000;
@@ -45,6 +51,12 @@ pub enum Error {
     EventTooLarge(usize),
     #[error("failed to upload log batch: {0}")]
     PutLogsError(#[from] RusotoError<PutLogEventsError>),
+    #[error("failed to lock the mutex")]
+    PoisonedLock,
+    #[error("upload thread already started")]
+    ThreadAlreadyStarted,
+    #[error("failed to spawn thread: {0}")]
+    SpawnError(io::Error),
 }
 
 /// An inclusive range of timestamps.
@@ -187,44 +199,20 @@ pub struct UploadTarget {
     pub stream: String,
 }
 
-pub struct BatchUploader {
+struct BatchUploaderInternal {
     target: UploadTarget,
 
     queued_batches: QueuedBatches,
 
     client: CloudWatchLogsClient,
     next_sequence_token: Option<String>,
+
+    thread_started: bool,
 }
 
-impl BatchUploader {
-    pub fn new(
-        client: CloudWatchLogsClient,
-        target: UploadTarget,
-    ) -> BatchUploader {
-        BatchUploader {
-            target,
-            client,
-            queued_batches: QueuedBatches::default(),
-            next_sequence_token: None,
-        }
-    }
-
-    /// Add a new event.
-    ///
-    /// There are a couple AWS limits not enforced yet:
-    ///
-    /// - None of the log events in the batch can be more than 2 hours
-    ///   in the future
-    ///
-    /// - None of the log events in the batch can be older than 14 days
-    ///   or older than the retention period of the log group
+impl BatchUploaderInternal {
     #[throws]
-    pub fn add_event(&mut self, event: InputLogEvent) {
-        self.queued_batches.add_event(event)?;
-    }
-
-    #[throws]
-    pub fn upload_batch(&mut self) {
+    fn upload_batch(&mut self) {
         let mut batch = if let Some(batch) = self.queued_batches.batches.pop() {
             *batch
         } else {
@@ -258,9 +246,79 @@ impl BatchUploader {
             }
         }
     }
+}
 
-    pub fn start_background_thread(&self) {
-        // TODO
+#[derive(Clone)]
+pub struct BatchUploader {
+    internal: Arc<Mutex<BatchUploaderInternal>>,
+}
+
+impl BatchUploader {
+    pub fn new(
+        client: CloudWatchLogsClient,
+        target: UploadTarget,
+    ) -> BatchUploader {
+        BatchUploader {
+            internal: Arc::new(Mutex::new(BatchUploaderInternal {
+                target,
+                client,
+                queued_batches: QueuedBatches::default(),
+                next_sequence_token: None,
+                thread_started: false,
+            })),
+        }
+    }
+
+    /// Add a new event.
+    ///
+    /// There are a couple AWS limits not enforced yet:
+    ///
+    /// - None of the log events in the batch can be more than 2 hours
+    ///   in the future
+    ///
+    /// - None of the log events in the batch can be older than 14 days
+    ///   or older than the retention period of the log group
+    #[throws]
+    pub fn add_event(&self, event: InputLogEvent) {
+        let mut guard =
+            self.internal.lock().map_err(|_| Error::PoisonedLock)?;
+        guard.queued_batches.add_event(event)?;
+    }
+
+    #[throws]
+    pub fn start_background_thread(&self) -> thread::JoinHandle<()> {
+        let mut guard =
+            self.internal.lock().map_err(|_| Error::PoisonedLock)?;
+        // Prevent multiple upload threads from being started
+        if guard.thread_started {
+            throw!(Error::ThreadAlreadyStarted);
+        }
+        guard.thread_started = true;
+
+        let builder =
+            thread::Builder::new().name("cloudwatch-logs-upload".into());
+        let internal = self.internal.clone();
+        let handle = builder
+            .spawn(move || loop {
+                if let Ok(mut guard) = internal.lock() {
+                    // There is a quota of 5 requests per second per log
+                    // stream, so upload up to five batches, then sleep
+                    // for at least one second.
+                    for _ in 0..5 {
+                        if let Err(err) = guard.upload_batch() {
+                            error!(
+                                "CloudWatch Logs batch upload failed: {}",
+                                err
+                            );
+                        }
+                    }
+                } else {
+                    error!("CloudWatch Logs bad lock");
+                }
+                thread::sleep(Duration::from_secs(1));
+            })
+            .map_err(Error::SpawnError)?;
+        handle
     }
 }
 
