@@ -47,19 +47,68 @@ pub enum Error {
     PutLogsError(#[from] RusotoError<PutLogEventsError>),
 }
 
-pub type Batch = PutLogEventsRequest;
+/// An inclusive range of timestamps.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TimestampRange {
+    pub start: Timestamp,
+    pub end: Timestamp,
+}
+
+impl TimestampRange {
+    /// Create a range for a single instant in time.
+    pub fn new(t: Timestamp) -> TimestampRange {
+        TimestampRange { start: t, end: t }
+    }
+
+    /// Time in milliseconds between start and end.
+    pub fn duration_in_millis(&self) -> i64 {
+        self.end - self.start
+    }
+
+    /// Adjust start and end as needed to include `t`.
+    pub fn expand_to_include(&mut self, t: Timestamp) {
+        if t < self.start {
+            self.start = t;
+        }
+        if t > self.end {
+            self.end = t;
+        }
+    }
+
+    /// Create a new TimestampRange with start and end adjusted as
+    /// needed to include `t`.
+    pub fn expand_to_include_copy(&self, t: Timestamp) -> TimestampRange {
+        let mut copy = *self;
+        copy.expand_to_include(t);
+        copy
+    }
+}
 
 #[derive(Default)]
 pub struct QueuedBatches {
     /// Queued batches that haven't been sent yet.
     ///
     /// Box the batch so that adding and removing elements from the
-    /// vector is cheap.
+    /// batches vector is cheap.
+    ///
+    /// Events are queued up in a vector that is not necessarily in
+    /// order. CloudWatch Logs requires events to be sorted by
+    /// timestamp, but in practice if you have a lot of events coming
+    /// in from different threads they will end up being out of order
+    /// due to waiting on a shared lock. So if you try to keep the
+    /// events in each batch in order, and start a new batch every
+    /// time an out-of-order event is received, the batches end up
+    /// being very small.
     #[allow(clippy::vec_box)]
-    batches: Vec<Box<Batch>>,
+    batches: Vec<Box<Vec<InputLogEvent>>>,
 
     /// Total size of the batch at the end of the batches vector.
     current_batch_size: usize,
+
+    /// Oldest and newest timestamps of events in the batch at the end
+    /// of the batches vector. This is used to ensure that a batch
+    /// does not exceed the 24-hour limit.
+    current_batch_time_range: TimestampRange,
 }
 
 impl QueuedBatches {
@@ -81,15 +130,19 @@ impl QueuedBatches {
         }
 
         if self.is_new_batch_needed(&event, event_size) {
-            self.batches.push(Box::new(Batch::default()));
+            self.batches.push(Box::new(Vec::new()));
             self.current_batch_size = 0;
+            self.current_batch_time_range =
+                TimestampRange::new(event.timestamp);
         }
 
+        self.current_batch_size += event_size;
+        self.current_batch_time_range
+            .expand_to_include(event.timestamp);
         // Ok to unwrap here, the code above ensures there is at least
         // one available batch
         let batch = self.batches.last_mut().unwrap();
-        batch.log_events.push(event);
-        self.current_batch_size += event_size;
+        batch.push(event);
     }
 
     fn is_new_batch_needed(
@@ -97,35 +150,29 @@ impl QueuedBatches {
         event: &InputLogEvent,
         event_size: usize,
     ) -> bool {
+        // Ensure there's at least one batch
         let batch = if let Some(batch) = self.batches.last() {
             batch
         } else {
-            // Ensure there's at least one batch
             return true;
         };
 
-        if batch.log_events.len() >= MAX_EVENTS_IN_BATCH {
-            // Maximum number of events exceeded
+        // Check if maximum number of events exceeded
+        if batch.len() >= MAX_EVENTS_IN_BATCH {
             return true;
         }
 
+        // Check if maximum payload size exceeded
         if self.current_batch_size + event_size > MAX_BATCH_SIZE {
-            // Maximum payload size exceeded
             return true;
         }
 
-        if let Some(last_event) = batch.log_events.last() {
-            if last_event.timestamp > event.timestamp {
-                // Timestamp is not in-order
-                return true;
-            }
-        }
-
-        if let Some(first_event) = batch.log_events.first() {
-            // Time between the new event and the first event in the batch
-            let duration_millis = event.timestamp - first_event.timestamp;
-            if duration_millis > MAX_DURATION_MILLIS {
-                // Batch cannot span more than 24 hours
+        // Check if 24-hour limit is exceeded
+        if !batch.is_empty() {
+            let new_range = self
+                .current_batch_time_range
+                .expand_to_include_copy(event.timestamp);
+            if new_range.duration_in_millis() > MAX_DURATION_MILLIS {
                 return true;
             }
         }
@@ -179,16 +226,22 @@ impl BatchUploader {
     #[throws]
     pub fn upload_batch(&mut self) {
         let mut batch = if let Some(batch) = self.queued_batches.batches.pop() {
-            batch
+            *batch
         } else {
             return;
         };
 
-        batch.sequence_token = self.next_sequence_token.clone();
-        batch.log_group_name = self.target.group.clone();
-        batch.log_stream_name = self.target.stream.clone();
+        // The events must be sorted by timestamp
+        batch.sort_unstable_by_key(|event| event.timestamp);
 
-        match self.client.put_log_events(*batch).sync() {
+        let req = PutLogEventsRequest {
+            log_events: batch,
+            sequence_token: self.next_sequence_token.clone(),
+            log_group_name: self.target.group.clone(),
+            log_stream_name: self.target.stream.clone(),
+        };
+
+        match self.client.put_log_events(req).sync() {
             Ok(resp) => {
                 self.next_sequence_token = resp.next_sequence_token;
 
@@ -196,8 +249,7 @@ impl BatchUploader {
             }
             Err(err) => {
                 // TODO: if the batch upload failed, consider putting
-                // the batch back. Unfortunately this requires cloning
-                // the batch.
+                // the batch back.
 
                 // TODO: I assume that if this happens we need to refresh the
                 // sequence token
@@ -316,13 +368,13 @@ mod tests {
         .unwrap();
         assert_eq!(qb.batches.len(), 1);
 
-        // Add an event at time 0, verify it goes into a new batch
+        // Add an event at time 0, verify it goes into the same batch
         qb.add_event(InputLogEvent {
             message: "".to_string(),
             timestamp: 0,
         })
         .unwrap();
-        assert_eq!(qb.batches.len(), 2);
+        assert_eq!(qb.batches.len(), 1);
     }
 
     #[test]
