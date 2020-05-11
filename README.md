@@ -1,5 +1,8 @@
 # cloudwatch-logs-upload
 
+[![crates.io](https://img.shields.io/crates/v/cloudwatch-logs-upload.svg)](https://crates.io/crates/cloudwatch-logs-upload)
+[![Documentation](https://docs.rs/cloudwatch-logs-upload/badge.svg)](https://docs.rs/cloudwatch-logs-upload)
+
 Rust library for uploading events to AWS CloudWatch Logs.
 
 This library uses [rusoto](https://github.com/rusoto/rusoto). It
