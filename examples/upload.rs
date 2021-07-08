@@ -1,12 +1,14 @@
 use cloudwatch_logs_upload::{
     get_current_timestamp, BatchUploader, UploadTarget,
 };
+use log::LevelFilter;
 use rand::Rng;
 use rusoto_core::{Region, RusotoError};
 use rusoto_logs::{
     CloudWatchLogs, CloudWatchLogsClient, CreateLogStreamError,
     CreateLogStreamRequest, InputLogEvent,
 };
+use simple_logger::SimpleLogger;
 use std::{env, thread, time};
 
 /// Create the log stream (the log group is assumed to already exist).
@@ -30,7 +32,10 @@ fn create_log_stream(client: &CloudWatchLogsClient, group: &str, stream: &str) {
 }
 
 fn main() {
-    simple_logger::init_with_level(log::Level::Info).unwrap();
+    SimpleLogger::new()
+        .with_level(LevelFilter::Info)
+        .init()
+        .unwrap();
 
     let args = env::args().collect::<Vec<_>>();
     if args.len() <= 2 {
