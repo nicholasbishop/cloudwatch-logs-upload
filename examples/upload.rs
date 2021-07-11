@@ -20,9 +20,9 @@ fn create_log_stream(client: &CloudWatchLogsClient, group: &str, stream: &str) {
     if let Err(err) = resp {
         if !matches!(
             err,
-            RusotoError::Service(
-                CreateLogStreamError::ResourceAlreadyExists(_),
-            )
+            RusotoError::Service(CreateLogStreamError::ResourceAlreadyExists(
+                _
+            ),)
         ) {
             panic!("failed to create log stream: {}", err);
         }
