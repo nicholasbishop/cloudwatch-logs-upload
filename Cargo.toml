@@ -20,5 +20,5 @@ rusoto_core = { version = "0.42", default_features = false, features = ["rustls"
 rusoto_logs = { version = "0.42", default_features = false, features = ["rustls"] }
 
 [dev-dependencies]
-rand = "0.7"
-simple_logger = "1.6"
+rand = "0.8"
+simple_logger = "1.11"
