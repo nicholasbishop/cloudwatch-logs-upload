@@ -65,7 +65,7 @@ fn main() {
             let mut rng = rand::thread_rng();
             loop {
                 thread::sleep(time::Duration::from_millis(
-                    rng.gen_range(0, 1000),
+                    rng.gen_range(0..1000),
                 ));
 
                 uploader
