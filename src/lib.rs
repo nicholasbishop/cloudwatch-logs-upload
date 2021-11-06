@@ -1,3 +1,7 @@
+//! Rust library for uploading events to AWS CloudWatch Logs.
+
+#![warn(missing_docs)]
+
 use fehler::{throw, throws};
 use log::error;
 use rusoto_core::RusotoError;
