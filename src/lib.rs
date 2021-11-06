@@ -82,7 +82,9 @@ pub enum Error {
 /// An inclusive range of timestamps.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TimestampRange {
+    /// Start time (inclusive).
     pub start: Timestamp,
+    /// End time (inclusive).
     pub end: Timestamp,
 }
 
@@ -326,6 +328,7 @@ pub struct BatchUploader {
 }
 
 impl BatchUploader {
+    /// Create a new `BatchUploader`.
     pub fn new(
         client: CloudWatchLogsClient,
         target: UploadTarget,
