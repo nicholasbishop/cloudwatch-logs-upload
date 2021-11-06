@@ -2,7 +2,7 @@
 name = "cloudwatch-logs-upload"
 version = "0.6.1-alpha.0"
 authors = ["Nicholas Bishop <nicholasbishop@gmail.com>"]
-edition = "2018"
+edition = "2021"
 description = "Library for uploading events to AWS CloudWatch Logs"
 keywords = ["aws", "cloudwatch", "logs"]
 repository = "https://github.com/nicholasbishop/cloudwatch-logs-upload"
