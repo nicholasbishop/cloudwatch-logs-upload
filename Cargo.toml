@@ -10,15 +10,15 @@ license = "Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-fehler = "1.0"
-log = "0.4"
-thiserror = "1.0"
+fehler = "1.0.0"
+log = "0.4.14"
+thiserror = "1.0.30"
 
 # TODO: stay on 0.42 for now because it provides a convenient
 # synchronous interface.
-rusoto_core = { version = "0.42", default_features = false, features = ["rustls"] }
-rusoto_logs = { version = "0.42", default_features = false, features = ["rustls"] }
+rusoto_core = { version = "0.42.0", default_features = false, features = ["rustls"] }
+rusoto_logs = { version = "0.42.0", default_features = false, features = ["rustls"] }
 
 [dev-dependencies]
-rand = "0.8"
-simple_logger = "1.11"
+rand = "0.8.4"
+simple_logger = "1.13.0"
